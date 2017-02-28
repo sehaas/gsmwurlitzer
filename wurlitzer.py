@@ -4,6 +4,8 @@ import serial
 import serial.threaded
 import threading
 import time
+import re
+import subprocess
 from messaging.sms import SmsDeliver, SmsSubmit
 from enum import Enum
 
@@ -28,6 +30,8 @@ def print_dbg(*args):
 class WurlitzerProtocol(serial.threaded.LineReader):
 
 	TERMINATOR = b'\r\n'
+	CLCC_REGEX = re.compile(r'\+CLCC: (\d),(\d),(\d),(\d),(\d),"(.+)",(\d{1,3}),"(.*)"')
+	CALL_STATES = ['BUSY', 'RING', 'NO CARRIER', 'NO ANSWER', 'NO DIALTONE']
 
 	def __init__(self):
 		super(WurlitzerProtocol, self).__init__()
@@ -36,7 +40,9 @@ class WurlitzerProtocol(serial.threaded.LineReader):
 		self.status = Status.IDLE
 		self.responses = queue.Queue()
 		self.events = queue.Queue()
-		self._event_thread = threading.Thread(target=self._run_event)
+		self.clcc_outgoing = queue.Queue()
+		self.clcc_incoming = queue.Queue()
+		self._event_thread = threading.Thread(target=self.__run_event)
 		self._event_thread.daemon = True
 		self._event_thread.name = "wrlz-event"
 		self._event_thread.start()
@@ -47,10 +53,10 @@ class WurlitzerProtocol(serial.threaded.LineReader):
 		self.events.put(None)
 		self.responses.put('<exit>')
 
-	def _run_event(self):
+	def __run_event(self):
 		while self.alive:
 			try:
-				self.handle_event(self.events.get())
+				self.__handle_event(self.events.get())
 			except:
 				logging.exception('_run_event')
 
@@ -59,7 +65,7 @@ class WurlitzerProtocol(serial.threaded.LineReader):
 		self.command('AT+CFUN=1')	# enable full functionality
 		self.command('AT+COLP=0')	# do not block on ATD...
 		self.command('AT+CLCC=1')	# report state of current calls
-		self.command('AT+CLIP=1')	# indicate incomming call via '+CLIP:...'
+		self.command('AT+CLIP=0')	# do not indicate incomming call via '+CLIP:...'
 		self.command('AT+CMGF=0')	# enable PDU mode for SMS
 		self.command('AT+CNMI=2,2')	# handle SMS directly via '+CMT:...'
 
@@ -73,44 +79,91 @@ class WurlitzerProtocol(serial.threaded.LineReader):
 			self.events.put(line)
 			return
 
-		if line.startswith('+CMT'):
+		clcc_match = self.CLCC_REGEX.match(line)
+		if clcc_match != None and clcc_match.group(2) == '0':
+			# outgoing call
+			self.clcc_outgoing.put(line)
+		elif clcc_match != None and clcc_match.group(2) == '1': 
+			# incoming call
+			self.clcc_incoming.put(line)
+		elif line.startswith('+CMT'):
 			self.status = Status.INCOMING_SMS
 			# next line is PDU
 		elif line.startswith('+CMGS'):
 			self.responses.put(line); # last sent SMS-identifier
-		elif line.startswith('+COLP'):
-			self.status = Status.ACTIVE_CALL
-		elif line.startswith('+CLIP'):
-			self.status = Status.INCOMING_CALL
-			self.handle_call(line)
+		elif line in self.CALL_STATES:
+			print_dbg('ignore call state: ', line)
 		elif line.startswith('+'):
 			self.events.put(line)
 		else:
 			self.responses.put(line)
 
-	def handle_event(self, event):
+	def __handle_event(self, event):
 		print_dbg('event received:', event)
 		if self.status == Status.INCOMING_SMS:
 			self.status = Status.IDLE
-			self.handle_sms(event)
+			self.__handle_sms(event)
 
-	def handle_sms(self, pdu):
+	def __handle_sms(self, pdu):
 		sms = SmsDeliver(pdu)
 		print_dbg('SMS from:', sms.number, 'text:', sms.text);
 		cmd = sms.text.split(None, 1)[0] # only use first word
 		if cmd in self.playlist.keys():
-			audio = self.playlist.get(cmd)
-			print_dbg('PLAY: ', audio)
+			self.next_song = self.playlist.get(cmd)
+			print_dbg('PLAY: ', cmd)
+			self.__place_call(sms.number)
 		else:
 			response = SmsSubmit(sms.number, '> ' + '\n> '.join(self.playlist.keys()))
-			resp_pdu = response.to_pdu()[0] # FIXME loop, to support longer SMS
-			print_dbg('RESP: ', resp_pdu.pdu)
-			# cannot wait for response '> ' due to missing '\r'
-			self.command(b'AT+CMGS=%d' % resp_pdu.length, None)
-			time.sleep(1) # just wait 1sec instead
-			self.command(b'%s\x1a' % resp_pdu.pdu)
+			for resp_pdu in response.to_pdu():
+				print_dbg('RESP: ', resp_pdu.pdu)
+				# cannot wait for response '> ' due to missing '\r'
+				self.command(b'AT+CMGS=%d' % resp_pdu.length, None)
+				time.sleep(1) # just wait 1sec instead
+				self.command(b'%s\x1a' % resp_pdu.pdu)
 
-	def handle_call(self, line):
+	def __place_call(self, number):
+		print_dbg('Calling: ', number)
+		self.command('ATD%s;' % number)
+		call_state = 'CALLING'
+		timeout_cnt = 3
+		player = None
+		while True:
+			try:
+				clcc = self.clcc_outgoing.get(timeout = 10)
+				print_dbg('CLCC: ', clcc)
+				status = self.CLCC_REGEX.match(clcc).group(3)
+				if   status == '0': # ACTIVE
+					print_dbg('ACTIVE')
+					call_state = 'PLAYING'
+					player = subprocess.Popen(['mpg123', '-q', self.next_song])
+					print_dbg('PLAYING: ', self.next_song)
+				elif status == '2': # DAILING
+					print_dbg('DAILING')
+				elif status == '3': # ALERTING (ring?)
+					print_dbg('ALERTING')
+				elif status == '6': # DISCONNECT
+					print_dbg('DISCONNECT')
+					if player != None:
+						player.kill()
+					return
+			except queue.Empty:
+				print_dbg('queue empty')
+				if call_state == 'CALLING':
+					timeout_cnt -= 1
+					print_dbg('TIMEOUT ', timeout_cnt)
+				elif call_state == 'PLAYING':
+					if player.poll() != None:
+						print_dbg('SONG FINISHED - HANGUP')
+						player = None
+						self.command('ATH')
+					else:
+						print_dbg('still playing')
+				if timeout_cnt <= 0:
+					print_dbg('TIMEOUT - HANGUP')
+					self.command('ATH')
+
+
+	def __handle_call(self, line):
 		print_dbg('TODO handle call')
 
 	def command(self, command, response='OK', timeout=10):
