@@ -5,9 +5,13 @@ import serial.threaded
 import threading
 import time
 import re
-import subprocess
 from messaging.sms import SmsDeliver, SmsSubmit
 from enum import Enum
+
+if os.name == 'posix' and sys.version_info[0] < 3:
+	import subprocess32 as subprocess
+else:
+    import subprocess
 
 try:
 	import queue
@@ -74,7 +78,7 @@ class WurlitzerProtocol(serial.threaded.LineReader):
   			self.playlist = dict(l.rstrip().split(None, 1) for l in f)
 
 	def handle_line(self, line):
-		print_dbg('DEBUG: ', line)
+		print_dbg('INPUT: ', line)
 		if self.status == Status.INCOMING_SMS:
 			self.events.put(line)
 			return
@@ -87,10 +91,11 @@ class WurlitzerProtocol(serial.threaded.LineReader):
 			# incoming call
 			self.clcc_incoming.put(line)
 		elif line.startswith('+CMT'):
+			# set status; next line is PDU
 			self.status = Status.INCOMING_SMS
-			# next line is PDU
 		elif line.startswith('+CMGS'):
-			self.responses.put(line); # last sent SMS-identifier
+			# last sent SMS-identifier
+			self.responses.put(line);
 		elif line in self.CALL_STATES:
 			print_dbg('ignore call state: ', line)
 		elif line.startswith('+'):
@@ -109,19 +114,20 @@ class WurlitzerProtocol(serial.threaded.LineReader):
 		print_dbg('SMS from:', sms.number, 'text:', sms.text);
 		cmd = sms.text.split(None, 1)[0] # only use first word
 		if cmd in self.playlist.keys():
-			self.next_song = self.playlist.get(cmd)
+			song = self.playlist.get(cmd)
 			print_dbg('PLAY: ', cmd)
-			self.__place_call(sms.number)
+			self.__place_call(sms.number, song)
 		else:
-			response = SmsSubmit(sms.number, '> ' + '\n> '.join(self.playlist.keys()))
+			print_dbg('SEND PLAYLIST')
+			response = SmsSubmit(sms.number, 'Select song:\n> ' + '\n> '.join(self.playlist.keys()))
 			for resp_pdu in response.to_pdu():
-				print_dbg('RESP: ', resp_pdu.pdu)
+				print_dbg('RESP:', resp_pdu.pdu)
 				# cannot wait for response '> ' due to missing '\r'
 				self.command(b'AT+CMGS=%d' % resp_pdu.length, None)
 				time.sleep(1) # just wait 1sec instead
 				self.command(b'%s\x1a' % resp_pdu.pdu)
 
-	def __place_call(self, number):
+	def __place_call(self, number, song):
 		print_dbg('Calling: ', number)
 		self.command('ATD%s;' % number)
 		call_state = 'CALLING'
@@ -135,8 +141,8 @@ class WurlitzerProtocol(serial.threaded.LineReader):
 				if   status == '0': # ACTIVE
 					print_dbg('ACTIVE')
 					call_state = 'PLAYING'
-					player = subprocess.Popen(['mpg123', '-q', self.next_song])
-					print_dbg('PLAYING: ', self.next_song)
+					player = subprocess.Popen(['mpg123', '-q', song])
+					print_dbg('PLAYING: ', song)
 				elif status == '2': # DAILING
 					print_dbg('DAILING')
 				elif status == '3': # ALERTING (ring?)
@@ -178,7 +184,7 @@ class WurlitzerProtocol(serial.threaded.LineReader):
 					if line == response:
 						return lines
 					else:
-						print_dbg('WAIT: ', line)
+						print_dbg('CHECK RESPONSE: ', line)
 						lines.append(line)
 				except queue.Empty:
 					raise ATException('AT command timeout ({!r})'.format(command))
