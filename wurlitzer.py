@@ -113,7 +113,10 @@ class WurlitzerProtocol(serial.threaded.LineReader):
 
 	def __handle_sms(self, pdu):
 		sms = SmsDeliver(pdu)
-		print_dbg('SMS from:', sms.number, 'text:', sms.text);
+		print_dbg('SMS:', sms.number, 'text:', sms.text);
+		if not sms.number.startswith('+436'):
+			print_dbg('SKIP non austrian number')
+			return
 		cmd = sms.text.split(None, 1)[0] # only use first word
 		if cmd in self.playlist.keys():
 			song = self.playlist.get(cmd)
